@@ -4,6 +4,8 @@ fn main() {
         res.set_icon("assets/icon.ico");
         res.set("ProductName", "screenrec");
         res.set("FileDescription", "screenrec 录屏工具");
+        res.set("CompanyName", "Rosa-panda");
+        res.set("LegalCopyright", "https://github.com/Rosa-panda/screenrec");
         if let Err(e) = res.compile() {
             println!("cargo:warning=嵌入图标失败: {e}");
         }

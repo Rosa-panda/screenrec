@@ -20,6 +20,7 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D11::{ID3D11DeviceContext, ID3D11Texture2D};
 
 use crate::audio::{self, AudioInput};
+use crate::clock::Clock;
 use crate::encoder::{self, Backend, Codec};
 use crate::mf::{MfAudio, MfConfig, MfWriter};
 use crate::video::{self, BoxError, FrameStore, SendD3D, Target};
@@ -68,7 +69,8 @@ pub enum Phase {
 pub struct SessionState {
     pub stop: AtomicBool,
     pub phase: Mutex<Phase>,
-    pub t0: Mutex<Option<Instant>>,
+    /// 录制时钟（暂停时停走），视频/音频配速共用
+    pub clock: Arc<Clock>,
     pub sent: AtomicU64,
     pub captured: AtomicU64,
     pub size: AtomicU64,
@@ -88,8 +90,18 @@ impl SessionState {
     fn set_phase(&self, p: Phase) {
         *self.phase.lock().unwrap() = p;
     }
+    /// 已录制时长（秒，不含暂停）
     pub fn elapsed(&self) -> f64 {
-        self.t0.lock().unwrap().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0)
+        self.clock.elapsed()
+    }
+    pub fn is_paused(&self) -> bool {
+        self.clock.is_paused()
+    }
+    /// 暂停 / 继续（只在录制中有效）
+    pub fn toggle_pause(&self) {
+        if self.phase() == Phase::Recording {
+            self.clock.set_paused(!self.clock.is_paused());
+        }
     }
     pub fn error(&self) -> Option<String> {
         self.error.lock().unwrap().clone()
@@ -117,7 +129,7 @@ impl Session {
         let state = Arc::new(SessionState {
             stop: AtomicBool::new(false),
             phase: Mutex::new(Phase::Starting),
-            t0: Mutex::new(None),
+            clock: Arc::new(Clock::default()),
             sent: AtomicU64::new(0),
             captured: AtomicU64::new(0),
             size: AtomicU64::new(0),
@@ -198,31 +210,35 @@ fn accept_with_timeout(listener: TcpListener, stop: &AtomicBool) -> Option<TcpSt
     }
 }
 
-/// 第 k 帧（k 从 0 起）应在 t0 + k/fps 发出；此刻应已发出的帧数 = floor(elapsed*fps)+1
-fn frames_due(t0: Instant, fps: u32) -> u64 {
-    (t0.elapsed().as_secs_f64() * fps as f64) as u64 + 1
+/// 第 k 帧（k 从 0 起）应在录制时刻 k/fps 发出；此刻应已发出的帧数 = floor(elapsed*fps)+1
+fn frames_due(clock: &Clock, fps: u32) -> u64 {
+    (clock.elapsed() * fps as f64) as u64 + 1
 }
 
-fn sleep_until_frame(t0: Instant, fps: u32, n: u64) {
-    let due = t0 + Duration::from_secs_f64(n as f64 / fps as f64);
-    if let Some(d) = due.checked_duration_since(Instant::now()) {
-        std::thread::sleep(d);
+fn sleep_until_frame(clock: &Clock, fps: u32, n: u64) {
+    if clock.is_paused() {
+        std::thread::sleep(Duration::from_millis(10));
+        return;
+    }
+    let wait = n as f64 / fps as f64 - clock.elapsed();
+    if wait > 0.0 {
+        std::thread::sleep(Duration::from_secs_f64(wait));
     }
 }
 
 fn video_pacer(
     store: Arc<FrameStore>,
     fps: u32,
-    t0: Instant,
     stop: Arc<AtomicBool>,
     sent: Arc<SessionState>,
     mut stdin: ChildStdin,
 ) {
+    let clock = sent.clock.clone();
     let mut local: Vec<u8> = Vec::new();
     let mut n: u64 = 0;
     loop {
         let stopping = stop.load(Ordering::Relaxed);
-        let target = frames_due(t0, fps);
+        let target = frames_due(&clock, fps);
         while n < target {
             {
                 let slot = store.slot.lock().unwrap();
@@ -239,7 +255,7 @@ fn video_pacer(
         if stopping {
             break;
         }
-        sleep_until_frame(t0, fps, n);
+        sleep_until_frame(&clock, fps, n);
     }
     let _ = stdin.flush();
     // drop(stdin) => ffmpeg 收到 EOF
@@ -255,14 +271,14 @@ fn gpu_pacer(
     pool: SendD3D<Vec<ID3D11Texture2D>>,
     writer: Arc<Mutex<MfWriter>>,
     fps: u32,
-    t0: Instant,
     stop: Arc<AtomicBool>,
     st: Arc<SessionState>,
 ) -> Result<(), String> {
+    let clock = st.clock.clone();
     let mut n: u64 = 0;
     loop {
         let stopping = stop.load(Ordering::Relaxed);
-        let target = frames_due(t0, fps);
+        let target = frames_due(&clock, fps);
         while n < target {
             let tex = &pool.0[(n % POOL as u64) as usize];
             unsafe {
@@ -278,7 +294,7 @@ fn gpu_pacer(
         if stopping {
             break;
         }
-        sleep_until_frame(t0, fps, n);
+        sleep_until_frame(&clock, fps, n);
     }
     Ok(())
 }
@@ -474,7 +490,6 @@ fn main_loop(
     cfg: &RecordConfig,
     st: &Arc<SessionState>,
     store: &Arc<FrameStore>,
-    t0: Instant,
     stop: &AtomicBool,
     mut extra: impl FnMut() -> Option<&'static str>,
 ) -> &'static str {
@@ -484,7 +499,7 @@ fn main_loop(
             break;
         }
         if let Some(d) = cfg.duration {
-            if t0.elapsed().as_secs_f64() >= d {
+            if st.elapsed() >= d {
                 exit_reason = "到达设定时长";
                 break;
             }
@@ -539,19 +554,18 @@ fn run_ffmpeg(
         });
     }
 
-    // 统一时间起点：此后视频/音频都按 t0 配速
-    let t0 = Instant::now();
+    // 统一时间起点：此后视频/音频都按同一个录制时钟配速
     for s in &cfg.audio {
         s.ring.lock().unwrap().clear();
     }
-    *st.t0.lock().unwrap() = Some(t0);
+    st.clock.start();
     st.set_phase(Phase::Recording);
 
     let stop = Arc::new(AtomicBool::new(false));
     let video_thread = {
         let (store, stop, st) = (store.clone(), stop.clone(), st.clone());
         let fps = cfg.fps;
-        std::thread::spawn(move || video_pacer(store, fps, t0, stop, st, stdin))
+        std::thread::spawn(move || video_pacer(store, fps, stop, st, stdin))
     };
     let mut audio_threads = Vec::new();
     for (src, pipe) in cfg.audio.iter().zip(pipes.into_iter()) {
@@ -560,13 +574,13 @@ fn run_ffmpeg(
         let st2 = st.clone();
         audio_threads.push(std::thread::spawn(move || {
             match accept_with_timeout(pipe.listener, &stop) {
-                Some(conn) => audio::run_pacer(ring, rate, ch, t0, stop, conn),
+                Some(conn) => audio::run_pacer(ring, rate, ch, st2.clock.clone(), stop, conn),
                 None => st2.log(format!("[{label}] ffmpeg 未连接音频通道")),
             }
         }));
     }
 
-    let exit_reason = main_loop(cfg, st, store, t0, &stop, || {
+    let exit_reason = main_loop(cfg, st, store, &stop, || {
         matches!(child.try_wait(), Ok(Some(_))).then_some("ffmpeg 提前退出")
     });
     stop.store(true, Ordering::Relaxed);
@@ -619,11 +633,10 @@ fn run_zero_copy(
         format!("MF {}（零拷贝，{:.0} Mbps）", codec_label(cfg.codec), writer.bitrate as f64 / 1e6);
     let writer = Arc::new(Mutex::new(writer));
 
-    let t0 = Instant::now();
     for s in &cfg.audio {
         s.ring.lock().unwrap().clear();
     }
-    *st.t0.lock().unwrap() = Some(t0);
+    st.clock.start();
     st.set_phase(Phase::Recording);
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -631,13 +644,14 @@ fn run_zero_copy(
         let (stop, st, writer) = (stop.clone(), st.clone(), writer.clone());
         let fps = cfg.fps;
         let (context, latest, pool) = (SendD3D(context), SendD3D(latest), SendD3D(pool));
-        std::thread::spawn(move || gpu_pacer(context, latest, pool, writer, fps, t0, stop, st))
+        std::thread::spawn(move || gpu_pacer(context, latest, pool, writer, fps, stop, st))
     };
     let audio_thread = (!cfg.audio.is_empty()).then(|| {
         let inputs = cfg.audio.clone();
         let (stop, st, writer) = (stop.clone(), st.clone(), writer.clone());
         std::thread::spawn(move || {
-            audio::run_mixer(inputs, 48000, 2, t0, stop, |pcm| match writer.lock().unwrap().write_audio(pcm, 2) {
+            let clock = st.clock.clone();
+            audio::run_mixer(inputs, 48000, 2, clock, stop, |pcm| match writer.lock().unwrap().write_audio(pcm, 2) {
                 Ok(()) => true,
                 Err(e) => {
                     st.log(format!("音频写入失败: {e}"));
@@ -647,7 +661,7 @@ fn run_zero_copy(
         })
     });
 
-    main_loop(cfg, st, store, t0, &stop, || None);
+    main_loop(cfg, st, store, &stop, || None);
     stop.store(true, Ordering::Relaxed);
     store.stop.store(true, Ordering::Relaxed);
     let video_result = video_thread.join().unwrap_or_else(|_| Err("视频线程崩溃".into()));

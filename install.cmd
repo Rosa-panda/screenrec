@@ -11,6 +11,7 @@ set "DEST=%LOCALAPPDATA%\Programs\screenrec"
 if not exist "%DEST%" mkdir "%DEST%"
 copy /y "target\release\screenrec.exe" "%DEST%\" >nul
 copy /y "target\release\screenrec-gui.exe" "%DEST%\" >nul
+copy /y "target\release\screenrec-interp.exe" "%DEST%\" >nul
 if exist "tools\rife" (
   robocopy "tools\rife" "%DEST%\rife" /e /njh /njs /ndl /nfl >nul
 )

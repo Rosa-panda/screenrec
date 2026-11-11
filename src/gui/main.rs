@@ -1,22 +1,28 @@
 //! screenrec 图形界面（egui/eframe）。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod hotkeys;
+mod process_ui;
+mod settings_ui;
+
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, RichText, Sense, Stroke, Vec2};
-use global_hotkey::hotkey::{Code, HotKey};
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use serde::{Deserialize, Serialize};
 use windows_capture::monitor::Monitor;
 use windows_capture::window::Window;
 
 use screenrec::audio::{self, AudioSource};
 use screenrec::encoder::{self, Backend, Codec};
-use screenrec::recorder::{Engine, Phase, RecordConfig, Session, SessionState};
+use screenrec::process;
+use screenrec::recorder::{Engine, Phase, RecordConfig, Session};
 use screenrec::video::Target;
+
+use hotkeys::{Hotkeys, ShotCfg};
+use process_ui::{ProcSettings, ProcUi};
 
 // ---------- 配色 ----------
 const BG: Color32 = Color32::from_rgb(24, 24, 32);
@@ -43,7 +49,15 @@ enum Preset {
     Custom,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Record,
+    Process,
+    Settings,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct Settings {
     source: SourceKind,
     monitor_index: usize,
@@ -65,8 +79,14 @@ struct Settings {
     output_dir: PathBuf,
     minimize_on_start: bool,
     show_advanced: bool,
-    #[serde(default)]
     engine: Engine,
+    /// 快捷键（如 "F9"、"Ctrl+Shift+R"；空 = 不设置）
+    hk_record: String,
+    hk_pause: String,
+    hk_shot: String,
+    /// 定时停止（分钟），0 = 不限时
+    auto_stop_min: u32,
+    proc: ProcSettings,
 }
 
 impl Default for Settings {
@@ -96,6 +116,11 @@ impl Default for Settings {
             minimize_on_start: true,
             show_advanced: false,
             engine: Engine::Standard,
+            hk_record: "F9".into(),
+            hk_pause: "F10".into(),
+            hk_shot: "F8".into(),
+            auto_stop_min: 0,
+            proc: ProcSettings::default(),
         }
     }
 }
@@ -125,9 +150,12 @@ struct App {
     last_file: Option<PathBuf>,
     last_error: Option<String>,
     notice: Option<String>,
-    _hotkey: Option<GlobalHotKeyManager>,
-    hotkey_err: Option<String>,
-    hk: Arc<HotkeyShared>,
+    tab: Tab,
+    hotkeys: Hotkeys,
+    /// 改键时的提示（按键不合适等）
+    hk_msg: Option<String>,
+    rife: Result<PathBuf, String>,
+    proc: ProcUi,
 }
 
 impl App {
@@ -139,19 +167,7 @@ impl App {
             .unwrap_or_default();
         let host = cpal::default_host();
         let ffmpeg = encoder::find_ffmpeg(None).map_err(|e| e.to_string());
-
-        let hotkey = HotKey::new(None, Code::F9);
-        let (mgr, hotkey_id, hotkey_err) = match GlobalHotKeyManager::new() {
-            Ok(m) => match m.register(hotkey) {
-                Ok(()) => (Some(m), Some(hotkey.id()), None),
-                Err(e) => (Some(m), None, Some(format!("F9 热键注册失败: {e}"))),
-            },
-            Err(e) => (None, None, Some(format!("热键不可用: {e}"))),
-        };
-        let hk = Arc::new(HotkeyShared::default());
-        if let Some(id) = hotkey_id {
-            spawn_hotkey_thread(id, hk.clone(), cc.egui_ctx.clone());
-        }
+        let rife = process::find_rife(None).map_err(|e| e.to_string());
 
         let mut app = Self {
             s,
@@ -173,12 +189,54 @@ impl App {
             last_file: None,
             last_error: None,
             notice: None,
-            _hotkey: mgr,
-            hotkey_err,
-            hk,
+            tab: Tab::Record,
+            hotkeys: Hotkeys::new(&cc.egui_ctx),
+            hk_msg: None,
+            rife,
+            proc: ProcUi::default(),
         };
+        app.apply_hotkeys();
         app.refresh_sources();
         app
+    }
+
+    fn open_output_dir(&self) {
+        let _ = std::fs::create_dir_all(&self.s.output_dir);
+        let _ = std::process::Command::new("explorer").arg(&self.s.output_dir).spawn();
+    }
+
+    /// 把截图所需的设置同步给热键线程，并取回上一次截图的结果。
+    fn sync_screenshot(&mut self) {
+        let shared = &self.hotkeys.shared;
+        *shared.shot_cfg.lock().unwrap() = Some(ShotCfg {
+            monitor: self.s.source == SourceKind::Monitor,
+            monitor_index: self.s.monitor_index,
+            window_title: self.s.window_title.clone(),
+            cursor: self.s.cursor,
+            dir: self.s.output_dir.clone(),
+            ffmpeg: self.ffmpeg.as_ref().ok().cloned(),
+        });
+        let result = shared.shot_result.lock().unwrap().take();
+        match result {
+            Some(Ok(path)) => {
+                self.notice = Some(format!(
+                    "截图已保存  {}",
+                    path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+                ));
+                self.last_error = None;
+            }
+            Some(Err(e)) => self.last_error = Some(e),
+            None => {}
+        }
+    }
+
+    /// 按钮上显示的快捷键提示，如 "   (F9)"；未设置则为空。
+    fn hk_hint(combo: &str) -> String {
+        if combo.is_empty() {
+            String::new()
+        } else {
+            format!("   ({combo})")
+        }
     }
 
     fn refresh_sources(&mut self) {
@@ -312,14 +370,14 @@ impl App {
             audio_bitrate: self.s.audio_bitrate,
             separate_tracks: self.s.separate_tracks,
             audio: inputs,
-            duration: None,
+            duration: (self.s.auto_stop_min > 0).then(|| self.s.auto_stop_min as f64 * 60.0),
             ffmpeg,
             engine: self.s.engine,
             hide_console: true,
             echo_ffmpeg: false,
         };
         let session = Session::start(cfg);
-        *self.hk.session.lock().unwrap() = Some(session.state.clone());
+        *self.hotkeys.shared.session.lock().unwrap() = Some(session.state.clone());
         self.session = Some(session);
         if self.s.minimize_on_start {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -338,7 +396,7 @@ impl App {
             return;
         }
         let session = self.session.take().unwrap();
-        *self.hk.session.lock().unwrap() = None;
+        *self.hotkeys.shared.session.lock().unwrap() = None;
         let st = session.state.clone();
         match session.wait() {
             Ok(()) => {
@@ -356,56 +414,9 @@ impl App {
     }
 
     fn poll_hotkey(&mut self, ctx: &egui::Context) {
-        // 热键在独立线程里处理（见 spawn_hotkey_thread）；这里只响应它发来的“开始”请求
-        if self.hk.start_requested.swap(false, Ordering::Relaxed) && !self.is_recording() {
+        // 热键在独立线程里处理（见 hotkeys.rs）；这里只响应它发来的“开始”请求
+        if self.hotkeys.shared.start_requested.swap(false, Ordering::Relaxed) && !self.is_recording() {
             self.start(ctx);
-        }
-    }
-}
-
-/// 热键线程与界面线程共享的状态。
-#[derive(Default)]
-struct HotkeyShared {
-    /// 当前录制会话（界面线程在开始/结束时更新）
-    session: Mutex<Option<Arc<SessionState>>>,
-    /// 热键线程请求界面线程开始录制
-    start_requested: AtomicBool,
-}
-
-/// F9 在独立线程里处理：窗口最小化时界面循环不运行，停止录制不能依赖界面。
-/// 停止直接作用于会话；开始需要界面线程的设置与音频流，所以先唤醒窗口再由界面线程执行。
-fn spawn_hotkey_thread(id: u32, hk: Arc<HotkeyShared>, ctx: egui::Context) {
-    std::thread::spawn(move || {
-        while let Ok(ev) = GlobalHotKeyEvent::receiver().recv() {
-            if ev.id != id || ev.state != HotKeyState::Pressed {
-                continue;
-            }
-            let active = hk
-                .session
-                .lock()
-                .unwrap()
-                .as_ref()
-                .filter(|s| !matches!(s.phase(), Phase::Done | Phase::Failed))
-                .cloned();
-            match active {
-                Some(s) => s.request_stop(),
-                None => hk.start_requested.store(true, Ordering::Relaxed),
-            }
-            wake_window();
-            ctx.request_repaint();
-        }
-    });
-}
-
-/// 窗口最小化时把它恢复出来（不抢焦点），界面循环才会继续运行。
-fn wake_window() {
-    use windows::core::w;
-    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, IsIconic, ShowWindow, SW_SHOWNOACTIVATE};
-    unsafe {
-        if let Ok(hwnd) = FindWindowW(None, w!("screenrec 录屏")) {
-            if IsIconic(hwnd).as_bool() {
-                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            }
         }
     }
 }
@@ -506,8 +517,18 @@ impl eframe::App for App {
         let ctx = &root.ctx().clone();
         self.poll_session(ctx);
         self.poll_hotkey(ctx);
+        self.poll_hotkey_capture(ctx, self.tab == Tab::Settings);
+        self.sync_screenshot();
         if !self.is_recording() {
             self.sync_audio();
+        }
+        // 把视频文件拖进窗口 = 送去「视频处理」
+        let dropped = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()));
+        if let Some(path) = dropped {
+            if !self.proc.busy() {
+                self.set_proc_src(path);
+                self.tab = Tab::Process;
+            }
         }
         // 电平表：取峰值并带衰减
         let decay = 0.85;
@@ -524,19 +545,23 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     self.ui_header(ui);
                     ui.add_space(6.0);
-                    self.ui_record_area(ui, ctx, recording);
-                    ui.add_space(10.0);
-                    ui.add_enabled_ui(!recording, |ui| {
-                        self.ui_source(ui);
-                        ui.add_space(8.0);
-                        self.ui_audio(ui);
-                        ui.add_space(8.0);
-                        self.ui_quality(ui);
-                        ui.add_space(8.0);
-                        self.ui_output(ui);
-                    });
-                    ui.add_space(8.0);
-                    self.ui_footer(ui);
+                    match self.tab {
+                        Tab::Record => {
+                            self.ui_record_area(ui, ctx, recording);
+                            ui.add_space(10.0);
+                            ui.add_enabled_ui(!recording, |ui| {
+                                self.ui_source(ui);
+                                ui.add_space(8.0);
+                                self.ui_audio(ui);
+                                ui.add_space(8.0);
+                                self.ui_quality(ui);
+                            });
+                            ui.add_space(8.0);
+                            self.ui_footer(ui);
+                        }
+                        Tab::Process => self.ui_process(ui),
+                        Tab::Settings => self.ui_settings(ui, recording),
+                    }
                 });
             });
     }
@@ -550,15 +575,22 @@ impl App {
             ui.painter().circle_filled(rect.center(), 6.0, color);
             ui.label(RichText::new("screenrec").size(20.0).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let paused = self.session.as_ref().is_some_and(|s| s.state.is_paused());
                 let status = match self.session.as_ref().map(|s| s.state.phase()) {
                     None => "就绪".to_string(),
                     Some(Phase::Starting) => "准备中…".into(),
+                    Some(Phase::Recording) if paused => "已暂停".into(),
                     Some(Phase::Recording) => "录制中".into(),
                     Some(Phase::Finishing) => "正在收尾…".into(),
                     Some(_) => "完成".into(),
                 };
                 ui.label(RichText::new(status).color(MUTED));
             });
+        });
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.tab, Tab::Record, "   录制   ");
+            ui.selectable_value(&mut self.tab, Tab::Process, "   视频处理   ");
+            ui.selectable_value(&mut self.tab, Tab::Settings, "   设置   ");
         });
     }
 
@@ -583,25 +615,45 @@ impl App {
         });
         ui.add_space(8.0);
         let phase = self.session.as_ref().map(|s| s.state.phase());
+        let rec_hint = Self::hk_hint(&self.s.hk_record);
         match phase {
             None => {
-                if big_button(ui, "●  开始录制   (F9)", ACCENT, self.ffmpeg.is_ok()) {
+                if big_button(ui, &format!("●  开始录制{rec_hint}"), ACCENT, self.ffmpeg.is_ok()) {
                     self.start(ctx);
                 }
             }
             Some(Phase::Finishing) => {
                 big_button(ui, "正在写入文件…", Color32::from_rgb(60, 60, 76), false);
             }
-            Some(_) => {
-                if big_button(ui, "■  停止录制   (F9)", Color32::from_rgb(70, 70, 94), true) {
-                    self.stop();
-                }
+            Some(phase) => {
+                let paused = self.session.as_ref().is_some_and(|s| s.state.is_paused());
+                let pause_hint = Self::hk_hint(&self.s.hk_pause);
+                ui.columns(2, |cols| {
+                    if big_button(&mut cols[0], &format!("■  停止{rec_hint}"), Color32::from_rgb(70, 70, 94), true) {
+                        self.stop();
+                    }
+                    let (text, color) = if paused {
+                        (format!("▶  继续{pause_hint}"), OK_GREEN.gamma_multiply(0.7))
+                    } else {
+                        (format!("⏸  暂停{pause_hint}"), Color32::from_rgb(70, 70, 94))
+                    };
+                    if big_button(&mut cols[1], &text, color, phase == Phase::Recording) {
+                        if let Some(s) = &self.session {
+                            s.state.toggle_pause();
+                        }
+                    }
+                });
             }
         }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.s.minimize_on_start, "开始后最小化窗口");
-            if let Some(e) = &self.hotkey_err {
+            if ui.button(format!("截图{}", Self::hk_hint(&self.s.hk_shot))).clicked() {
+                hotkeys::take_screenshot(self.hotkeys.shared.clone(), ctx.clone());
+            }
+            if ui.button("打开保存文件夹").clicked() {
+                self.open_output_dir();
+            }
+            if let Some(e) = self.hotkeys.errors.iter().flatten().next().or(self.hotkeys.general_err.as_ref()) {
                 ui.label(RichText::new(e).color(WARN).size(12.0));
             }
         });
@@ -691,11 +743,7 @@ impl App {
             ui.add_space(4.0);
             // 麦克风
             ui.horizontal(|ui| {
-                let r = ui.checkbox(&mut self.s.mic, "麦克风    ");
-                if r.changed() {
-                    let info = ui.input(|i| format!("pointer={:?} events={:?}", i.pointer.interact_pos(), i.events));
-                    debug_log(&format!("mic checkbox changed -> {} clicked={} {info}", self.s.mic, r.clicked()));
-                }
+                ui.checkbox(&mut self.s.mic, "麦克风    ");
                 ui.add_enabled_ui(self.s.mic, |ui| {
                     let current = if self.s.mic_device.is_empty() {
                         "默认麦克风".to_string()
@@ -787,26 +835,6 @@ impl App {
         });
     }
 
-    fn ui_output(&mut self, ui: &mut egui::Ui) {
-        card(ui, "输出", |ui| {
-            ui.horizontal(|ui| {
-                let dir = self.s.output_dir.display().to_string();
-                ui.label(RichText::new(dir).color(TEXT));
-            });
-            ui.horizontal(|ui| {
-                if ui.button("选择文件夹…").clicked() {
-                    if let Some(d) = rfd::FileDialog::new().set_directory(&self.s.output_dir).pick_folder() {
-                        self.s.output_dir = d;
-                    }
-                }
-                if ui.button("打开文件夹").clicked() {
-                    let _ = std::fs::create_dir_all(&self.s.output_dir);
-                    let _ = std::process::Command::new("explorer").arg(&self.s.output_dir).spawn();
-                }
-            });
-        });
-    }
-
     fn ui_footer(&mut self, ui: &mut egui::Ui) {
         if let Some(e) = &self.last_error {
             let first = e.lines().next().unwrap_or("").to_string();
@@ -829,6 +857,10 @@ impl App {
                 }
                 if ui.small_button("在文件夹中显示").clicked() {
                     let _ = std::process::Command::new("explorer").arg(format!("/select,{}", f.display())).spawn();
+                }
+                if !self.proc.busy() && ui.small_button("插帧 / 处理此视频").clicked() {
+                    self.set_proc_src(f.clone());
+                    self.tab = Tab::Process;
                 }
             });
         }

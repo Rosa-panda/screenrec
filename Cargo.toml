@@ -14,7 +14,11 @@ path = "src/main.rs"
 
 [[bin]]
 name = "screenrec-gui"
-path = "src/bin/gui.rs"
+path = "src/gui/main.rs"
+
+[[bin]]
+name = "screenrec-interp"
+path = "src/bin/interp.rs"
 
 [dependencies]
 windows-capture = "2.0"
@@ -47,3 +51,4 @@ winresource = "0.1"
 [profile.release]
 opt-level = 3
 lto = "thin"
+strip = true

@@ -6,11 +6,12 @@ use std::io::Write;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, SupportedStreamConfig};
 
+use crate::clock::Clock;
 use crate::video::BoxError;
 
 pub type Ring = Arc<Mutex<VecDeque<f32>>>;
@@ -200,7 +201,7 @@ pub fn run_pacer(
     ring: Ring,
     rate: u32,
     channels: u16,
-    t0: Instant,
+    clock: Arc<Clock>,
     stop: Arc<AtomicBool>,
     mut out: TcpStream,
 ) {
@@ -210,8 +211,11 @@ pub fn run_pacer(
     let tick = Duration::from_millis(10);
     loop {
         let stopping = stop.load(Ordering::Relaxed);
-        let elapsed = t0.elapsed().as_secs_f64();
-        let target = (elapsed * rate as f64) as u64;
+        if clock.is_paused() {
+            // 暂停期间的声音不进文件
+            ring.lock().unwrap().clear();
+        }
+        let target = (clock.elapsed() * rate as f64) as u64;
         let need = target.saturating_sub(sent_frames) as usize;
         if need > 0 {
             bytes.clear();
@@ -256,7 +260,7 @@ pub fn run_mixer(
     inputs: Vec<AudioInput>,
     out_rate: u32,
     out_ch: usize,
-    t0: Instant,
+    clock: Arc<Clock>,
     stop: Arc<AtomicBool>,
     mut sink: impl FnMut(&[i16]) -> bool,
 ) {
@@ -270,7 +274,13 @@ pub fn run_mixer(
     let tick = Duration::from_millis(10);
     loop {
         let stopping = stop.load(Ordering::Relaxed);
-        let target = (t0.elapsed().as_secs_f64() * out_rate as f64) as u64;
+        if clock.is_paused() {
+            // 暂停期间的声音不进文件
+            for s in &srcs {
+                s.input.ring.lock().unwrap().clear();
+            }
+        }
+        let target = (clock.elapsed() * out_rate as f64) as u64;
         let need = target.saturating_sub(sent) as usize;
         if need > 0 {
             mix.clear();
