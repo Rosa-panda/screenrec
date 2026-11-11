@@ -1,0 +1,6 @@
+/target
+/tools/_dl
+/tools/rife
+*.mp4
+*.mkv
+*.log

@@ -1,0 +1,49 @@
+[package]
+name = "screenrec"
+version = "0.2.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+name = "screenrec"
+path = "src/lib.rs"
+
+[[bin]]
+name = "screenrec"
+path = "src/main.rs"
+
+[[bin]]
+name = "screenrec-gui"
+path = "src/bin/gui.rs"
+
+[dependencies]
+windows-capture = "2.0"
+cpal = "0.18"
+ctrlc = "3.5"
+clap = { version = "4.5", features = ["derive"] }
+chrono = "0.4"
+eframe = { version = "0.37", features = ["persistence"] }
+egui = "0.37"
+rfd = "0.18"
+global-hotkey = "0.10"
+serde = { version = "1", features = ["derive"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
